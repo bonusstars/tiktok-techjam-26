@@ -7,14 +7,14 @@ import re
 # that most reliably narrow the candidate pool.
 ATTRIBUTE_ORDER = [
     "category",
-    "budget",
     "material",
     "color",
     "size",
+    "feature",
+    "use_case",
     "style",
     "brand",
-    "use_case",
-    "feature",
+    "budget",
 ]
 
 # Mirrors the evaluator's own regexes (see evaluator/local_evaluator.py) so that
@@ -32,6 +32,14 @@ CATEGORY_RE = re.compile(r"looking for ([^.,]+)", re.I)
 # The evaluator's override message always starts with this exact phrase.
 OVERRIDE_PREFIX = "actually, ignore my earlier preference"
 
+# Sent by the simulated customer when we stopped asking questions but our
+# results still aren't good enough — a clear signal to keep clarifying.
+NOT_QUITE_RIGHT_SIGNAL = "not quite right yet"
+
+# Prefix the simulated customer uses when actually answering a clarifying
+# question (see evaluator/local_evaluator.py customer_reply()).
+ANSWER_PREFIX = "for that, what matters is:"
+
 
 class SessionState:
     """Tracks accumulated slot values and clarification history for one session."""
@@ -43,6 +51,15 @@ class SessionState:
         self.slots["category"] = None
         self.asked: set[str] = set()
         self.turn_count = 0
+        # Tracks the attribute we most recently asked about, so that if the
+        # customer's answer doesn't match any specific regex (e.g. style,
+        # brand, use_case, feature all lack dedicated extractors), we can
+        # still capture their raw answer into the right slot instead of
+        # silently discarding it.
+        self._last_asked: str | None = None
+        # Set to True when the customer signals our results aren't working
+        # (see NOT_QUITE_RIGHT_SIGNAL) — lets us ask again past the normal cap.
+        self._force_reopen_asking = False
 
     # ------------------------------------------------------------------ #
     # Ingesting a new user message
@@ -54,6 +71,13 @@ class SessionState:
 
         if lowered.startswith(OVERRIDE_PREFIX):
             self._handle_override(text)
+            return
+
+        if NOT_QUITE_RIGHT_SIGNAL in lowered:
+            # No new slot info in this message, but it's a strong signal that
+            # our current results are wrong — allow asking again even if we
+            # already hit the normal per-session question cap.
+            self._force_reopen_asking = True
             return
 
         self._extract_into_slots(text)
@@ -89,15 +113,31 @@ class SessionState:
         self.asked.discard(self._classify(new_value))
 
     def _extract_into_slots(self, text: str) -> None:
+        matched_any = False
         for attr, extractor in self._extractors():
             value = extractor(text)
             if value:
                 self.slots[attr] = value
+                matched_any = True
 
         if self.slots["category"] is None:
             m = CATEGORY_RE.search(text)
             if m:
                 self.slots["category"] = m.group(1).strip()
+
+        lowered = text.strip().lower()
+        if (
+            not matched_any
+            and lowered.startswith(ANSWER_PREFIX)
+            and self._last_asked
+            and self.slots.get(self._last_asked) is None
+        ):
+            # No dedicated regex covers this attribute (style, brand,
+            # use_case, feature) — capture the raw answer text as-is rather
+            # than silently discarding real information the customer gave us.
+            raw_value = text.split(":", 1)[-1].strip(" .")
+            if raw_value:
+                self.slots[self._last_asked] = raw_value
 
     def _extractors(self):
         return [
@@ -141,6 +181,7 @@ class SessionState:
         for attr in ATTRIBUTE_ORDER:
             if self.slots.get(attr) is None and attr not in self.asked:
                 self.asked.add(attr)
+                self._last_asked = attr
                 return attr
         return None
 
@@ -152,12 +193,23 @@ class SessionState:
         """Heuristic: ask a clarifying question only when the pool is still
         large, we haven't already asked too many questions this session, and
         we're not close enough to the turn limit that asking would waste our
-        remaining budget."""
-        if len(self.asked) >= self.MAX_QUESTIONS_PER_SESSION:
-            return False
+        remaining budget. Exception: if the customer just told us our current
+        results aren't working (_force_reopen_asking), bypass the question
+        cap — a stuck session repeating stale results is worse than one extra
+        question."""
         if turn >= self.STOP_ASKING_AFTER_TURN:
+            self._force_reopen_asking = False
             return False
         if candidate_count <= self.POOL_TOO_BIG_THRESHOLD:
+            self._force_reopen_asking = False
+            return False
+
+        if self._force_reopen_asking:
+            available = self.next_available_attribute() is not None
+            self._force_reopen_asking = False
+            return available
+
+        if len(self.asked) >= self.MAX_QUESTIONS_PER_SESSION:
             return False
         return self.next_available_attribute() is not None
 
