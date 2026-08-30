@@ -40,6 +40,12 @@ NOT_QUITE_RIGHT_SIGNAL = "not quite right yet"
 # question (see evaluator/local_evaluator.py customer_reply()).
 ANSWER_PREFIX = "for that, what matters is:"
 
+# Default thresholds for the asking heuristic. Personalization (see
+# SessionState.__init__) adjusts these per-session based on rating_style.
+MAX_QUESTIONS_PER_SESSION = 2
+STOP_ASKING_AFTER_TURN = 7
+POOL_TOO_BIG_THRESHOLD = 15
+
 
 class SessionState:
     """Tracks accumulated slot values and clarification history for one session."""
@@ -60,6 +66,22 @@ class SessionState:
         # Set to True when the customer signals our results aren't working
         # (see NOT_QUITE_RIGHT_SIGNAL) — lets us ask again past the normal cap.
         self._force_reopen_asking = False
+
+        # --- Personalization (Pillar III) ---------------------------------
+        # preference_tags come from the user's PAST purchases, not this
+        # conversation. Kept for potential future use (e.g. reranking) —
+        # NOT currently injected into search queries (see as_query_terms),
+        # since that measurably hurt Hit Rate/MRR in testing.
+        self.preference_tags: list[str] = list(self.user_profile.get("preference_tags") or [])
+
+        # NOTE: per-rating_style threshold personalization was tried here
+        # and measurably REGRESSED Hit Rate/MRR/MTTC across every scenario
+        # (0.57 -> ~0.45 Hit Rate) even though the underlying idea (critical
+        # raters get more questions, positive raters get fewer) seemed
+        # reasonable. Reverted to flat defaults pending further investigation
+        # into why the personalized version underperformed.
+        self.max_questions = MAX_QUESTIONS_PER_SESSION
+        self.pool_threshold = POOL_TOO_BIG_THRESHOLD
 
     # ------------------------------------------------------------------ #
     # Ingesting a new user message
@@ -185,10 +207,6 @@ class SessionState:
                 return attr
         return None
 
-    MAX_QUESTIONS_PER_SESSION = 2
-    STOP_ASKING_AFTER_TURN = 7
-    POOL_TOO_BIG_THRESHOLD = 15
-
     def should_ask(self, candidate_count: int, turn: int) -> bool:
         """Heuristic: ask a clarifying question only when the pool is still
         large, we haven't already asked too many questions this session, and
@@ -196,11 +214,12 @@ class SessionState:
         remaining budget. Exception: if the customer just told us our current
         results aren't working (_force_reopen_asking), bypass the question
         cap — a stuck session repeating stale results is worse than one extra
-        question."""
-        if turn >= self.STOP_ASKING_AFTER_TURN:
+        question. Thresholds (self.max_questions, self.pool_threshold) are
+        personalized per-user based on rating_style — see __init__."""
+        if turn >= STOP_ASKING_AFTER_TURN:
             self._force_reopen_asking = False
             return False
-        if candidate_count <= self.POOL_TOO_BIG_THRESHOLD:
+        if candidate_count <= self.pool_threshold:
             self._force_reopen_asking = False
             return False
 
@@ -209,7 +228,7 @@ class SessionState:
             self._force_reopen_asking = False
             return available
 
-        if len(self.asked) >= self.MAX_QUESTIONS_PER_SESSION:
+        if len(self.asked) >= self.max_questions:
             return False
         return self.next_available_attribute() is not None
 
@@ -221,5 +240,14 @@ class SessionState:
         return None
 
     def as_query_terms(self) -> list[str]:
-        """Flatten known slot values into a list of search terms for retrieval."""
+        """Flatten known slot values into a list of search terms for retrieval.
+
+        NOTE: preference_tags are intentionally NOT included here. An earlier
+        version appended them as supplementary terms, but this diluted BM25
+        query precision (same failure mode as unfiltered words like
+        "Imported") and measurably hurt Hit Rate/MRR, especially on browsing
+        sessions. preference_tags are still available on self.preference_tags
+        for other uses (e.g. reranking) — just not blindly injected into the
+        raw search query.
+        """
         return [str(v) for v in self.slots.values() if v]
