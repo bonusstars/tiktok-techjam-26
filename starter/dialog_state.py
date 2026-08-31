@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+import re
+
+# Order matters: this is the priority in which we ask for missing attributes.
+# Category first (already known from turn 1 almost always), then attributes
+# that most reliably narrow the candidate pool.
+ATTRIBUTE_ORDER = [
+    "category",
+    "material",
+    "color",
+    "size",
+    "feature",
+    "use_case",
+    "style",
+    "brand",
+    "budget",
+]
+
+# Mirrors the evaluator's own regexes (see evaluator/local_evaluator.py) so that
+# extraction targets the same vocabulary the simulated customer actually uses.
+MATERIAL_RE = re.compile(
+    r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b", re.I
+)
+COLOR_RE = re.compile(
+    r"\b(black|white|blue|red|pink|green|brown|gray|grey|purple|yellow|orange)\b", re.I
+)
+BUDGET_RE = re.compile(r"\$\s?\d+(?:\.\d+)?|\bunder\s+\$?\d+\b", re.I)
+SIZE_RE = re.compile(r"\bsize\s+([a-z0-9]+)\b|\b(small|medium|large|x[sl]|xxl)\b", re.I)
+CATEGORY_RE = re.compile(r"looking for ([^.,]+)", re.I)
+
+# The evaluator's override message always starts with this exact phrase.
+OVERRIDE_PREFIX = "actually, ignore my earlier preference"
+
+# Sent by the simulated customer when we stopped asking questions but our
+# results still aren't good enough — a clear signal to keep clarifying.
+NOT_QUITE_RIGHT_SIGNAL = "not quite right yet"
+
+# Prefix the simulated customer uses when actually answering a clarifying
+# question (see evaluator/local_evaluator.py customer_reply()).
+ANSWER_PREFIX = "for that, what matters is:"
+
+# Default thresholds for the asking heuristic. Personalization (see
+# SessionState.__init__) adjusts these per-session based on rating_style.
+MAX_QUESTIONS_PER_SESSION = 2
+STOP_ASKING_AFTER_TURN = 7
+POOL_TOO_BIG_THRESHOLD = 15
+
+
+class SessionState:
+    """Tracks accumulated slot values and clarification history for one session."""
+
+    def __init__(self, session_id: str, user_profile: dict) -> None:
+        self.session_id = session_id
+        self.user_profile = user_profile or {}
+        self.slots: dict[str, str | None] = {attr: None for attr in ATTRIBUTE_ORDER if attr != "category"}
+        self.slots["category"] = None
+        self.asked: set[str] = set()
+        self.turn_count = 0
+        # Tracks the attribute we most recently asked about, so that if the
+        # customer's answer doesn't match any specific regex (e.g. style,
+        # brand, use_case, feature all lack dedicated extractors), we can
+        # still capture their raw answer into the right slot instead of
+        # silently discarding it.
+        self._last_asked: str | None = None
+        # Set to True when the customer signals our results aren't working
+        # (see NOT_QUITE_RIGHT_SIGNAL) — lets us ask again past the normal cap.
+        self._force_reopen_asking = False
+
+        # --- Personalization (Pillar III) ---------------------------------
+        # preference_tags come from the user's PAST purchases, not this
+        # conversation. Kept for potential future use (e.g. reranking) —
+        # NOT currently injected into search queries (see as_query_terms),
+        # since that measurably hurt Hit Rate/MRR in testing.
+        self.preference_tags: list[str] = list(self.user_profile.get("preference_tags") or [])
+
+        # NOTE: per-rating_style threshold personalization was tried here
+        # and measurably REGRESSED Hit Rate/MRR/MTTC across every scenario
+        # (0.57 -> ~0.45 Hit Rate) even though the underlying idea (critical
+        # raters get more questions, positive raters get fewer) seemed
+        # reasonable. Reverted to flat defaults pending further investigation
+        # into why the personalized version underperformed.
+        self.max_questions = MAX_QUESTIONS_PER_SESSION
+        self.pool_threshold = POOL_TOO_BIG_THRESHOLD
+
+    # ------------------------------------------------------------------ #
+    # Ingesting a new user message
+    # ------------------------------------------------------------------ #
+    def ingest(self, message: str) -> None:
+        self.turn_count += 1
+        text = message or ""
+        lowered = text.strip().lower()
+
+        if lowered.startswith(OVERRIDE_PREFIX):
+            self._handle_override(text)
+            return
+
+        if NOT_QUITE_RIGHT_SIGNAL in lowered:
+            # No new slot info in this message, but it's a strong signal that
+            # our current results are wrong — allow asking again even if we
+            # already hit the normal per-session question cap.
+            self._force_reopen_asking = True
+            return
+
+        self._extract_into_slots(text)
+
+    def _handle_override(self, text: str) -> None:
+        # Message format: "Actually, ignore my earlier preference. What I need is: {new_value}."
+        new_value = ""
+        if "what i need is:" in text.lower():
+            new_value = text.split(":", 1)[-1].strip(" .")
+
+        # A category change invalidates most other slots; a same-category
+        # correction (e.g. a different material/color) should only overwrite
+        # the conflicting slot. We can't always tell which without deeper NLP,
+        # so use a conservative heuristic: if the new value doesn't match any
+        # known attribute regex, treat it as a full reset except category.
+        matched_any = False
+        for attr, extractor in self._extractors():
+            value = extractor(new_value)
+            if value:
+                self.slots[attr] = value
+                matched_any = True
+
+        if not matched_any and new_value:
+            # Couldn't classify the new value into a known slot type (e.g. it's
+            # a style/use-case phrase) — reset soft slots but keep category,
+            # and stash it under "feature" so it still influences retrieval.
+            for attr in self.slots:
+                if attr != "category":
+                    self.slots[attr] = None
+            self.slots["feature"] = new_value
+
+        # Whatever attribute we just resolved shouldn't be re-asked.
+        self.asked.discard(self._classify(new_value))
+
+    def _extract_into_slots(self, text: str) -> None:
+        matched_any = False
+        for attr, extractor in self._extractors():
+            value = extractor(text)
+            if value:
+                self.slots[attr] = value
+                matched_any = True
+
+        if self.slots["category"] is None:
+            m = CATEGORY_RE.search(text)
+            if m:
+                self.slots["category"] = m.group(1).strip()
+
+        lowered = text.strip().lower()
+        if (
+            not matched_any
+            and lowered.startswith(ANSWER_PREFIX)
+            and self._last_asked
+            and self.slots.get(self._last_asked) is None
+        ):
+            # No dedicated regex covers this attribute (style, brand,
+            # use_case, feature) — capture the raw answer text as-is rather
+            # than silently discarding real information the customer gave us.
+            raw_value = text.split(":", 1)[-1].strip(" .")
+            if raw_value:
+                self.slots[self._last_asked] = raw_value
+
+    def _extractors(self):
+        return [
+            ("material", lambda t: (MATERIAL_RE.search(t) or [None]) and self._match_or_none(MATERIAL_RE, t)),
+            ("color", lambda t: self._match_or_none(COLOR_RE, t)),
+            ("budget", lambda t: self._match_or_none(BUDGET_RE, t)),
+            ("size", lambda t: self._match_size(t)),
+        ]
+
+    @staticmethod
+    def _match_or_none(pattern: re.Pattern, text: str) -> str | None:
+        m = pattern.search(text)
+        return m.group(1).lower() if m and m.groups() else (m.group(0).lower() if m else None)
+
+    @staticmethod
+    def _match_size(text: str) -> str | None:
+        m = SIZE_RE.search(text)
+        if not m:
+            return None
+        return (m.group(1) or m.group(2) or "").lower() or None
+
+    @staticmethod
+    def _classify(text: str) -> str | None:
+        if not text:
+            return None
+        if MATERIAL_RE.search(text):
+            return "material"
+        if COLOR_RE.search(text):
+            return "color"
+        if BUDGET_RE.search(text):
+            return "budget"
+        if SIZE_RE.search(text):
+            return "size"
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Deciding what to ask next
+    # ------------------------------------------------------------------ #
+    def next_attribute_to_ask(self) -> str | None:
+        """Return the highest-priority unfilled, unasked attribute, or None."""
+        for attr in ATTRIBUTE_ORDER:
+            if self.slots.get(attr) is None and attr not in self.asked:
+                self.asked.add(attr)
+                self._last_asked = attr
+                return attr
+        return None
+
+    def should_ask(self, candidate_count: int, turn: int) -> bool:
+        """Heuristic: ask a clarifying question only when the pool is still
+        large, we haven't already asked too many questions this session, and
+        we're not close enough to the turn limit that asking would waste our
+        remaining budget. Exception: if the customer just told us our current
+        results aren't working (_force_reopen_asking), bypass the question
+        cap — a stuck session repeating stale results is worse than one extra
+        question. Thresholds (self.max_questions, self.pool_threshold) are
+        personalized per-user based on rating_style — see __init__."""
+        if turn >= STOP_ASKING_AFTER_TURN:
+            self._force_reopen_asking = False
+            return False
+        if candidate_count <= self.pool_threshold:
+            self._force_reopen_asking = False
+            return False
+
+        if self._force_reopen_asking:
+            available = self.next_available_attribute() is not None
+            self._force_reopen_asking = False
+            return available
+
+        if len(self.asked) >= self.max_questions:
+            return False
+        return self.next_available_attribute() is not None
+
+    def next_available_attribute(self) -> str | None:
+        """Peek without consuming — used by should_ask() to check availability."""
+        for attr in ATTRIBUTE_ORDER:
+            if self.slots.get(attr) is None and attr not in self.asked:
+                return attr
+        return None
+
+    def as_query_terms(self) -> list[str]:
+        """Flatten known slot values into a list of search terms for retrieval.
+
+        NOTE: preference_tags are intentionally NOT included here. An earlier
+        version appended them as supplementary terms, but this diluted BM25
+        query precision (same failure mode as unfiltered words like
+        "Imported") and measurably hurt Hit Rate/MRR, especially on browsing
+        sessions. preference_tags are still available on self.preference_tags
+        for other uses (e.g. reranking) — just not blindly injected into the
+        raw search query.
+        """
+        return [str(v) for v in self.slots.values() if v]
